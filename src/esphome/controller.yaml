@@ -1,0 +1,293 @@
+esphome:
+  name: solar-monitor
+  friendly_name: Solar Monitor
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "ol2ClpeC0+HZrC85TcBiPv6Lc7QfjZddSzlkWIZpWns="
+
+# enable MQTT
+ota:
+  password: "5019dc65941ac24b879fa85408f9efd6"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Solar-Monitor Fallback Hotspot"
+    password: "U6FpheExyfMz"
+
+captive_portal:
+
+external_components:
+  - source: github://KinDR007/VictronMPPT-ESPHOME@main
+
+uart:
+  id: uart_0
+  tx_pin: GPIO3  # Not used! The communication is read-only
+  rx_pin: GPIO1
+  baud_rate: 19200
+  rx_buffer_size: 256
+
+victron:
+  id: victron0
+  uart_id: uart_0
+
+dallas:
+  - pin: GPIO21
+
+############################################
+
+globals:
+  # from shelly, via mqtt
+  - id: ac_power_import
+    type: float
+    initial_value: "0"
+  - id: is_ac_importing
+    type: bool
+    initial_value: "false"
+  # from victron
+  - id: pv_power_in
+    type: float
+    initial_value: "0"
+  - id: battery_voltage
+    type: float
+    initial_value: "24.0"
+  - id: soc
+    type: int
+    initial_value: "0"
+  - id: is_pv_producing
+    type: bool
+    initial_value: "false"
+  # from DTU, via mqtt
+  - id: is_dtu_enabled
+    type: bool
+    initial_value: "false"
+  - id: dtu_power_limit
+    type: float
+    initial_value: "0"
+
+mqtt:
+  id: mqtt_client
+  broker: 192.168.75.16
+  username: mqtt
+  password: !secret mqtt_password
+  on_json_message:
+    - topic: shellypro3em/events/rpc
+      then:
+        - lambda: |-
+            if (x.containsKey("params") && x["params"].containsKey("em:0") && x["params"]["em:0"].containsKey("total_act_power")) {
+              float total_act_power = x["params"]["em:0"]["total_act_power"];
+
+              if (total_act_power > 0) {
+                id(is_ac_importing) = true;
+                id(ac_power_import) = total_act_power;
+                ESP_LOGD("mqtt_shelly", "Power import: %f W", total_act_power);
+              } else {
+                id(is_ac_importing) = false;
+                id(ac_power_import) = 0.0;
+                ESP_LOGD("mqtt_shelly", "No power import");
+              }
+            } else {
+              ESP_LOGD("mqtt_shelly", "No value found");
+            }
+  on_message:
+    - topic: solar/112182049689/status/producing
+      then:
+        - lambda: |-
+            if (x == "1" && id(is_dtu_enabled) == false) {
+              id(is_dtu_enabled) = true;
+              ESP_LOGD("mqtt_dtu", "DTU is producing");
+            } else if (x == "0" && id(is_dtu_enabled) == true) {
+              id(is_dtu_enabled) = false;
+              ESP_LOGD("mqtt_dtu", "DTU is not producing");
+            }
+    - topic: solar/112182049689/status/limit_absolute
+      then:
+        - lambda: |-
+            float limit_absolute = parse_number<float>(x).value();
+            if (limit_absolute != id(dtu_power_limit)) {
+              id(dtu_power_limit) = limit_absolute;
+              ESP_LOGD("mqtt_dtu", "DTU power limit: %f W", limit_absolute);
+            }
+
+script:
+  - id: dtu_activation
+    parameters:
+      enable: bool
+    then:
+      - mqtt.publish: 
+          topic: "solar/112182049689/cmd/power"
+          payload: !lambda |-
+            std::string val = enable ? "1" : "0";
+            ESP_LOGI("mqtt_dtu", "Sending DTU power status: %s", val);
+            return val;
+  - id: dtu_set_power_limit
+    parameters:
+      limit: int
+    then:
+      - mqtt.publish: 
+          topic: "solar/112182049689/cmd/limit_nonpersistent_absolute"
+          payload: !lambda |-
+            int val = (limit / 10) * 10;
+            if (val < 0) {
+              val = 0;
+            }
+            if (val > 350) {
+              val = 350;
+            }
+            ESP_LOGI("mqtt_dtu", "Sending DTU power limit: %d W", val);
+            return to_string(val);
+
+####################################
+
+sensor:
+  - platform: victron
+    victron_id: victron0
+    panel_voltage:
+      name: "Panel voltage"
+    panel_power:
+      name: "Panel power"
+      on_value:
+        then:
+          - lambda: |-
+              if (x > 0) {
+                id(is_pv_producing) = true;
+                id(pv_power_in) = x;
+              } else {
+                id(is_pv_producing) = false;
+                id(pv_power_in) = 0.0;
+              }
+    battery_voltage:
+      name: "Battery voltage"
+      on_value:
+        then:
+          - lambda: |-
+              id(battery_voltage) = x;
+
+              // SOC helper
+              if (x > 26.8) {
+                id(soc) = 100;
+              } else if (x >= 26.6) {
+                id(soc) = 90;
+              } else if (x >= 26.4) {
+                id(soc) = 70;
+              } else if (x >= 26.2) {
+                id(soc) = 40;
+              } else if (x >= 25.8) {
+                id(soc) = 20;
+              } else if (x >= 25.0) {
+                id(soc) = 14;
+              } else if (x >= 24.0) {
+                id(soc) = 9;
+              } else {
+                id(soc) = 0;
+              }
+    battery_current:
+      name: "Battery current"
+    load_current:
+      name: "Load current"
+    yield_today:
+      name: "Yield today"
+  - platform: dallas
+    address: 0x85062260847d7c28
+    name: "Temperatur battery"
+  - platform: template
+    name: "SoC"
+    id: soc_sensor
+    lambda: |-
+      return id(soc);
+
+binary_sensor:
+  - platform: template
+    name: "PV production"
+    id: pv_production
+    lambda: |-
+      return id(is_pv_producing);
+  - platform: template
+    name: "AC importing"
+    id: ac_importing
+    lambda: |-
+      return id(is_ac_importing);
+
+text_sensor:
+  - platform: victron
+    victron_id: victron0
+    charging_mode:
+      name: "Charging mode"
+
+switch:
+  - platform: template
+    name: "AC production"
+    id: ac_enabled
+    lambda: "return id(is_dtu_enabled);"
+    turn_on_action:
+      - script.execute:
+          id: dtu_activation
+          enable: true
+    turn_off_action:
+      - script.execute:
+          id: dtu_activation
+          enable: false
+     
+number:
+  - platform: template
+    name: "AC power limit"
+    id: ac_power_limit
+    lambda: "return id(dtu_power_limit);"
+    unit_of_measurement: "W"
+    device_class: "power"
+    min_value: 10
+    max_value: 350
+    step: 10
+    set_action:
+      - script.execute:
+          id: dtu_set_power_limit
+          limit: !lambda "return x;"
+
+
+interval:
+  - interval: 10s
+    then:
+      - logger.log: "ping"
+      - lambda: |-
+          if (id(is_dtu_enabled) && id(soc) < 10) {
+            // stop DTU
+            ESP_LOGI("mainloop", "Disabling AC out");
+          }
+          if (!id(is_dtu_enabled) && id(soc) >= 20) {
+            // start DTU
+            ESP_LOGI("mainloop", "Enabling AC out");
+          }
+
+          if (!id(is_dtu_enabled)) {
+            return;
+          }
+
+          if (id(is_pv_producing)) {
+            if (id(soc) >= 90) {
+              // set DTU power := pv_power * 0.9
+            } else if (id(soc) >= 40) {
+              // set DTU power := pv_power * 0.5
+            } else {
+              // set DTU power := minimum
+            }
+
+          } else if (id(is_ac_importing)) {
+            // set DTU power := max(power_import, 350)
+
+          } else {
+            // set DTU power := minimum
+            
+          }
