@@ -77,6 +77,9 @@ globals:
   - id: dtu_power_limit
     type: float
     initial_value: "0"
+  - id: is_battery_low
+    type: bool
+    initial_value: "false"
 
 mqtt:
   id: mqtt_client
@@ -140,9 +143,12 @@ script:
       - mqtt.publish: 
           topic: "solar/112182049689/cmd/limit_nonpersistent_absolute"
           payload: !lambda |-
-            int val = (limit / 10) * 10;
+            int val = floor(limit / 10) * 10;
             if (val < 0) {
               val = 0;
+            }
+            if (val > id(ac_power_limit).state) {
+              val = id(ac_power_limit).state;
             }
             if (val > 350) {
               val = 350;
@@ -175,6 +181,12 @@ sensor:
         then:
           - lambda: |-
               id(battery_voltage) = x;
+              if (x < 24.0) {
+                id(is_battery_low) = true;
+              }
+              if (x >= 25.6) {
+                id(is_battery_low) = false;
+              }
 
               // SOC helper
               if (x > 26.8) {
@@ -220,6 +232,10 @@ binary_sensor:
     id: ac_importing
     lambda: |-
       return id(is_ac_importing);
+  - platform: template
+    name: "Battery UV protection"
+    lambda: |-
+      return id(is_battery_low);
 
 text_sensor:
   - platform: victron
@@ -231,44 +247,34 @@ switch:
   - platform: template
     name: "AC production"
     id: ac_enabled
-    lambda: "return id(is_dtu_enabled);"
-    turn_on_action:
-      - script.execute:
-          id: dtu_activation
-          enable: true
-    turn_off_action:
-      - script.execute:
-          id: dtu_activation
-          enable: false
+    optimistic: true
      
 number:
   - platform: template
     name: "AC power limit"
     id: ac_power_limit
-    lambda: "return id(dtu_power_limit);"
+    optimistic: true
     unit_of_measurement: "W"
     device_class: "power"
     min_value: 10
     max_value: 350
     step: 10
-    set_action:
-      - script.execute:
-          id: dtu_set_power_limit
-          limit: !lambda "return x;"
-
 
 interval:
   - interval: 10s
     then:
       - logger.log: "ping"
       - lambda: |-
-          if (id(is_dtu_enabled) && id(soc) < 10) {
+          if (id(is_dtu_enabled) && id(is_battery_low) || !id(ac_enabled).state) {
             // stop DTU
             ESP_LOGI("mainloop", "Disabling AC out");
+            id(dtu_activation)->execute(false);
+            id(dtu_set_power_limit)->execute(10);
           }
-          if (!id(is_dtu_enabled) && id(soc) >= 20) {
+          if (!id(is_dtu_enabled) && !id(is_battery_low) && id(ac_enabled).state) {
             // start DTU
             ESP_LOGI("mainloop", "Enabling AC out");
+            id(dtu_activation)->execute(true);
           }
 
           if (!id(is_dtu_enabled)) {
@@ -277,17 +283,18 @@ interval:
 
           if (id(is_pv_producing)) {
             if (id(soc) >= 90) {
-              // set DTU power := pv_power * 0.9
+              // set DTU power := pv_power_in * 0.9
             } else if (id(soc) >= 40) {
-              // set DTU power := pv_power * 0.5
+              // set DTU power := pv_power_in * 0.5
             } else {
               // set DTU power := minimum
             }
+            id(dtu_set_power_limit)->execute(id(pv_power_in) * 0.5);
 
           } else if (id(is_ac_importing)) {
-            // set DTU power := max(power_import, 350)
+            id(dtu_set_power_limit)->execute(id(ac_power_import));
 
           } else {
             // set DTU power := minimum
-            
+            id(dtu_set_power_limit)->execute(10);
           }
